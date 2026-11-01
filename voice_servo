@@ -1,0 +1,131 @@
+import threading
+import time
+import speech_recognition as sr
+from virtual_servo import VirtualServo
+from google import genai
+from google.genai import types
+
+# ---------------- SETTINGS ----------------
+API_KEY = "YOUR API KEY HERE"
+MODELS = ["gemini-3.8-flash", "gemini-flash-latest"]   # main model, then backup
+USE_ARDUINO = False        # change to True when the Arduino is back
+ARDUINO_PORT = "COM3"      # check Tools > Port in the Arduino IDE
+# ------------------------------------------
+
+servo = VirtualServo()
+
+arduino = None
+if USE_ARDUINO:
+    import serial
+    arduino = serial.Serial(ARDUINO_PORT, 9600)
+    time.sleep(2)          # Arduino resets when the port opens
+
+client = genai.Client(
+    api_key=API_KEY,
+    http_options=types.HttpOptions(timeout=20000),
+)
+
+SYSTEM = """You control a servo motor in a smart room. Reply with ONLY one command and nothing else:
+O = open (90 degrees)
+C = close (0 degrees)
+W = wave
+A<number> = go to that angle, 0-180, e.g. A45
+N = no action
+
+Rules: if the person says they are tired, sleepy, going to bed, or it is night -> C.
+If they say morning, wake up, bright, light, or let sunshine in -> O.
+If they greet someone or say hi/hello -> W.
+Only reply N if the sentence has nothing to do with the room, sleep, light or greeting.
+
+Examples:
+"I'm going to sleep" -> C
+"I am tired" -> C
+"time for bed" -> C
+"good morning" -> O
+"let some light in" -> O
+"it is too dark in here" -> O
+"say hi" -> W
+"greet my guest" -> W
+"open halfway" -> A45
+"what is the weather" -> N"""
+
+
+def send_command(cmd):
+    if USE_ARDUINO:
+        arduino.write((cmd + "\n").encode())
+    else:
+        servo.send(cmd)
+
+
+def keyword_match(text):
+    """Instant matching, no internet needed."""
+    t = text.lower()
+    words = t.split()
+    if "wave" in t or "hello" in words or "hi" in words or "greet" in t:
+        return "W"
+    if "open" in t or "wake" in t or "morning" in t:
+        return "O"
+    if "close" in t or "sleep" in t or "tired" in t or "bed" in t or "night" in t:
+        return "C"
+    for w in words:
+        if w.isdigit():
+            return f"A{w}"
+    return None
+
+
+def ask_gemini(text):
+    for model in MODELS:
+        try:
+            resp = client.models.generate_content(
+                model=model,
+                contents=text,
+                config=types.GenerateContentConfig(
+                    system_instruction=SYSTEM,
+                    temperature=0,
+                    max_output_tokens=50,
+                ),
+            )
+            print("Gemini replied:", resp.text)
+            cmd = resp.text.strip().upper().split()[0]
+            if cmd in ("O", "C", "W"):
+                return cmd
+            if cmd.startswith("A") and cmd[1:].isdigit():
+                return cmd
+            return None
+        except Exception as e:
+            print(f"{model} failed:", str(e)[:100])
+    print("Gemini unavailable")
+    return None
+
+
+def smart_interpret(text):
+    cmd = keyword_match(text)          # instant
+    if cmd:
+        print("Matched by keywords")
+        return cmd
+    return ask_gemini(text)            # only for unclear sentences
+
+
+def listen_loop():
+    r = sr.Recognizer()
+    r.pause_threshold = 0.6
+    with sr.Microphone() as mic:
+        r.adjust_for_ambient_noise(mic)
+        print("Listening... try: open, close, wave, 'angle 45', or a natural sentence")
+        while True:
+            audio = r.listen(mic)
+            try:
+                text = r.recognize_google(audio)
+                print("You said:", text)
+                cmd = smart_interpret(text)
+                print("Command:", cmd)
+                if cmd:
+                    send_command(cmd)
+            except sr.UnknownValueError:
+                pass                   # couldn't understand, keep listening
+            except Exception as e:
+                print("Error:", e)
+
+
+threading.Thread(target=listen_loop, daemon=True).start()
+servo.run()
